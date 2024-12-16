@@ -30,20 +30,18 @@ This project implements a work-stealing scheduler that efficiently distributes t
 
 The scheduler is built with a modular architecture consisting of several key components:
 
-```
 work_stealing/
 ├── cmd/
 │   └── main.go           # Demo application
 ├── internal/
-│   ├── core/             # Core components
+│   ├── core/
 │   │   ├── goroutine.go  # Task representation
 │   │   └── processor.go  # Processor implementation
-│   ├── queue/            # Queue implementations
-│   ├── scheduler/        # Scheduler logic
-│   ├── poller/          # Network poller
-│   └── visualization/    # UI components
+│   ├── queue/
+│   ├── scheduler/
+│   ├── poller/
+│   └── visualization/
 └── README.md
-```
 
 ## Features
 

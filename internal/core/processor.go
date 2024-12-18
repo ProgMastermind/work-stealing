@@ -7,7 +7,6 @@ import (
 	"time"
 )
 
-// ProcessorState represents the current state of a processor
 type ProcessorState int32
 
 const (
@@ -16,42 +15,8 @@ const (
     ProcessorStealing
 )
 
-// ProcessorStatus holds current processor metrics
-type ProcessorStatus struct {
-    CurrentGoroutine *Goroutine
-    QueueSize        int
-    State            ProcessorState
-    LastStateChange  time.Time
-}
-
-// ProcessorMetricsData represents the metrics data for external consumption
-type ProcessorMetricsData struct {
-    TasksExecuted      uint64
-    StealsAttempted    uint64
-    StealsSuccessful   uint64
-    TotalIdleTime      time.Duration
-    TotalRunningTime   time.Duration
-    LastMetricsReset   time.Time
-    GlobalQueueSteals  uint64
-    LocalQueueSteals   uint64
-    TasksFromPoller    uint64
-}
-
-// Processor represents a logical processor (P)
-type Processor struct {
-    id            uint32
-    state         atomic.Int32
-    localQueue    *Queue
-    currentG      atomic.Pointer[Goroutine]
-    maxQueueSize  int
-    mu            sync.RWMutex
-    metrics       *processorMetrics
-    lastStateTime time.Time
-    rand          *rand.Rand
-}
-
-// processorMetrics tracks processor performance using atomic operations
-type processorMetrics struct {
+// ProcessorMetrics tracks runtime statistics
+type ProcessorMetrics struct {
     tasksExecuted     atomic.Uint64
     stealsAttempted   atomic.Uint64
     stealsSuccessful  atomic.Uint64
@@ -59,37 +24,76 @@ type processorMetrics struct {
     totalRunningTime  atomic.Int64
     globalQueueSteals atomic.Uint64
     localQueueSteals  atomic.Uint64
-    tasksFromPoller   atomic.Uint64
-    lastMetricsReset  time.Time
 }
 
-// Queue represents the Local Run Queue
-type Queue struct {
-    items []*Goroutine
-    mu    sync.RWMutex
-    size  int
+// ProcessorStats represents externally visible metrics
+type ProcessorStats struct {
+    ID               uint32
+    State            ProcessorState
+    CurrentTask      *Goroutine
+    QueueSize        int
+    TasksExecuted    uint64
+    StealsAttempted  uint64
+    StealsSuccessful uint64
+    IdleTime         time.Duration
+    RunningTime      time.Duration
+    GlobalSteals     uint64
+    LocalSteals      uint64
+    LastStateChange  time.Time
+}
+
+// Processor represents a logical processor (P)
+type Processor struct {
+    id            uint32
+    state         atomic.Int32
+    maxQueueSize  int
+    currentG      atomic.Pointer[Goroutine]
+    metrics       ProcessorMetrics
+    lastStateTime time.Time
+
+    mu           sync.RWMutex
+    localQueue   *LocalRunQueue
+    globalQueue  *GlobalQueue    // Reference to global queue in same package
+    rand         *rand.Rand
+
+    // List of other processors for work stealing
+    processors   []*Processor
+}
+
+// LocalRunQueue manages the processor's local task queue
+type LocalRunQueue struct {
+    tasks    []*Goroutine
+    size     int
+    count    int
+    mu       sync.RWMutex
 }
 
 // NewProcessor creates a new processor instance
-func NewProcessor(id uint32, queueSize int) *Processor {
-    p := &Processor{
-        id:           id,
-        localQueue:   NewQueue(queueSize),
-        maxQueueSize: queueSize,
-        metrics: &processorMetrics{
-            lastMetricsReset: time.Now(),
-        },
-        rand: rand.New(rand.NewSource(time.Now().UnixNano())),
+func NewProcessor(id uint32, queueSize int, globalQueue *GlobalQueue) *Processor {
+    if queueSize <= 0 {
+        queueSize = 256
     }
-    p.state.Store(int32(ProcessorIdle))
-    p.lastStateTime = time.Now()
-    return p
+
+    return &Processor{
+        id:            id,
+        maxQueueSize:  queueSize,
+        localQueue:    newLocalRunQueue(queueSize),
+        globalQueue:   globalQueue,
+        lastStateTime: time.Now(),
+        rand:         rand.New(rand.NewSource(time.Now().UnixNano())),
+    }
 }
 
-// NewQueue creates a new local run queue
-func NewQueue(size int) *Queue {
-    return &Queue{
-        items: make([]*Goroutine, 0, size),
+// SetProcessors sets the list of processors for work stealing
+func (p *Processor) SetProcessors(processors []*Processor) {
+    p.mu.Lock()
+    defer p.mu.Unlock()
+    p.processors = processors
+}
+
+func newLocalRunQueue(size int) *LocalRunQueue {
+    return &LocalRunQueue{
+        tasks: make([]*Goroutine, 0, size),
         size:  size,
     }
 }
@@ -99,195 +103,246 @@ func (p *Processor) ID() uint32 {
     return p.id
 }
 
-// State returns the current processor state
+// State returns current processor state
 func (p *Processor) State() ProcessorState {
     return ProcessorState(p.state.Load())
 }
 
-// SetState updates the processor state and records timing
-func (p *Processor) SetState(state ProcessorState) {
+// SetState updates processor state with metrics
+func (p *Processor) SetState(newState ProcessorState) {
     p.mu.Lock()
     defer p.mu.Unlock()
 
     oldState := p.State()
     now := time.Now()
+    duration := now.Sub(p.lastStateTime)
 
-    // Update metrics based on state transition
-    p.updateStateMetrics(oldState, now.Sub(p.lastStateTime))
-
-    p.state.Store(int32(state))
-    p.lastStateTime = now
-}
-
-// Push adds a goroutine to the local queue
-func (p *Processor) Push(g *Goroutine) bool {
-    p.mu.Lock()
-    defer p.mu.Unlock()
-
-    if p.localQueue.Push(g) {
-        p.recordTaskSource(g.Source())
-        return true
-    }
-    return false
-}
-
-// Pop removes and returns a goroutine from the local queue
-func (p *Processor) Pop() *Goroutine {
-    p.mu.Lock()
-    defer p.mu.Unlock()
-    return p.localQueue.Pop()
-}
-
-// Steal attempts to steal goroutines from another processor
-func (p *Processor) Steal(victim *Processor) []*Goroutine {
-    if victim == nil || victim.ID() == p.ID() {
-        return nil
-    }
-
-    p.metrics.stealsAttempted.Add(1)
-
-    victim.mu.Lock()
-    defer victim.mu.Unlock()
-
-    stolen := victim.localQueue.Steal(p.maxQueueSize / 2)
-    if len(stolen) > 0 {
-        p.metrics.stealsSuccessful.Add(1)
-        p.metrics.localQueueSteals.Add(1)
-
-        // Mark stolen tasks
-        for _, g := range stolen {
-            g.SetSource(SourceStolen, victim.ID())
-        }
-    }
-
-    return stolen
-}
-
-// Queue methods
-func (q *Queue) Push(g *Goroutine) bool {
-    q.mu.Lock()
-    defer q.mu.Unlock()
-
-    if len(q.items) >= q.size {
-        return false
-    }
-
-    q.items = append(q.items, g)
-    return true
-}
-
-func (q *Queue) Pop() *Goroutine {
-    q.mu.Lock()
-    defer q.mu.Unlock()
-
-    if len(q.items) == 0 {
-        return nil
-    }
-
-    g := q.items[0]
-    q.items = q.items[1:]
-    return g
-}
-
-func (q *Queue) Size() int {
-    q.mu.RLock()
-    defer q.mu.RUnlock()
-    return len(q.items)
-}
-
-func (q *Queue) Steal(n int) []*Goroutine {
-    q.mu.Lock()
-    defer q.mu.Unlock()
-
-    if len(q.items) == 0 {
-        return nil
-    }
-
-    stealCount := len(q.items) / 2
-    if stealCount == 0 {
-        stealCount = 1
-    }
-    if stealCount > n {
-        stealCount = n
-    }
-
-    splitIndex := len(q.items) - stealCount
-    stolen := make([]*Goroutine, stealCount)
-    copy(stolen, q.items[splitIndex:])
-    q.items = q.items[:splitIndex]
-
-    return stolen
-}
-
-// GetStatus returns current processor status
-func (p *Processor) GetStatus() ProcessorStatus {
-    p.mu.RLock()
-    defer p.mu.RUnlock()
-
-    return ProcessorStatus{
-        CurrentGoroutine: p.currentG.Load(),
-        QueueSize:        p.localQueue.Size(),
-        State:            p.State(),
-        LastStateChange:  p.lastStateTime,
-    }
-}
-
-// updateStateMetrics updates timing metrics for different states
-func (p *Processor) updateStateMetrics(oldState ProcessorState, duration time.Duration) {
     switch oldState {
     case ProcessorIdle:
         p.metrics.totalIdleTime.Add(int64(duration))
     case ProcessorRunning:
         p.metrics.totalRunningTime.Add(int64(duration))
     }
+
+    p.state.Store(int32(newState))
+    p.lastStateTime = now
 }
 
-// GetMetrics returns current processor metrics
-func (p *Processor) GetMetrics() ProcessorMetricsData {
-    return ProcessorMetricsData{
-        TasksExecuted:     p.metrics.tasksExecuted.Load(),
-        StealsAttempted:   p.metrics.stealsAttempted.Load(),
-        StealsSuccessful:  p.metrics.stealsSuccessful.Load(),
-        TotalIdleTime:     time.Duration(p.metrics.totalIdleTime.Load()),
-        TotalRunningTime:  time.Duration(p.metrics.totalRunningTime.Load()),
-        LastMetricsReset:  p.metrics.lastMetricsReset,
-        GlobalQueueSteals: p.metrics.globalQueueSteals.Load(),
-        LocalQueueSteals:  p.metrics.localQueueSteals.Load(),
-        TasksFromPoller:   p.metrics.tasksFromPoller.Load(),
+// Push adds a goroutine to local queue
+func (p *Processor) Push(g *Goroutine) bool {
+    if g == nil {
+        return false
     }
-}
 
-// IncrementTasksExecuted increments the number of tasks executed
-func (p *Processor) IncrementTasksExecuted() {
-    p.metrics.tasksExecuted.Add(1)
-}
+    p.mu.Lock()
+    defer p.mu.Unlock()
 
-// recordTaskSource updates metrics based on task source
-func (p *Processor) recordTaskSource(source TaskSource) {
-    switch source {
-    case SourceGlobalQueue:
-        p.metrics.globalQueueSteals.Add(1)
-    case SourceLocalQueue:
-        p.metrics.localQueueSteals.Add(1)
-    case SourceNetworkPoller:
-        p.metrics.tasksFromPoller.Add(1)
+    if p.localQueue.count >= p.maxQueueSize {
+        return false
     }
+
+    return p.localQueue.push(g)
+}
+
+// Pop removes and returns a goroutine from local queue
+func (p *Processor) Pop() *Goroutine {
+    p.mu.Lock()
+    defer p.mu.Unlock()
+    return p.localQueue.pop()
+}
+
+// FindWork attempts to get work from various sources
+func (p *Processor) FindWork() *Goroutine {
+    // First try local queue
+    if g := p.Pop(); g != nil {
+        return g
+    }
+
+    // Then try stealing from other processors
+    if stolen := p.tryStealFromProcessors(); len(stolen) > 0 {
+        // Push extra stolen tasks to local queue
+        for i := 1; i < len(stolen); i++ {
+            p.Push(stolen[i])
+        }
+        return stolen[0]
+    }
+
+    // Finally try global queue
+    if stolen := p.tryStealFromGlobalQueue(); len(stolen) > 0 {
+        // Push extra stolen tasks to local queue
+        for i := 1; i < len(stolen); i++ {
+            p.Push(stolen[i])
+        }
+        return stolen[0]
+    }
+
+    return nil
 }
 
 // selectVictim randomly selects a processor to steal from
-func (p *Processor) selectVictim(processors []*Processor) *Processor {
-    if len(processors) <= 1 {
+func (p *Processor) selectVictim() *Processor {
+    p.mu.RLock()
+    defer p.mu.RUnlock()
+
+    if len(p.processors) <= 1 {
         return nil
     }
 
-    // Try up to 3 random victims
+    // Try up to 3 random processors
     for i := 0; i < 3; i++ {
-        victimIndex := p.rand.Intn(len(processors))
-        victim := processors[victimIndex]
-
-        if victim.ID() != p.ID() && victim.localQueue.Size() > 0 {
+        idx := p.rand.Intn(len(p.processors))
+        victim := p.processors[idx]
+        if victim.ID() != p.ID() && victim.QueueSize() > 0 {
             return victim
         }
     }
     return nil
+}
+
+// tryStealFromProcessors attempts to steal from other processors
+func (p *Processor) tryStealFromProcessors() []*Goroutine {
+    p.SetState(ProcessorStealing)
+    defer p.SetState(ProcessorIdle)
+
+    if victim := p.selectVictim(); victim != nil {
+        p.metrics.stealsAttempted.Add(1)
+        stolen := victim.localQueue.steal((victim.localQueue.count + 1) / 2)
+        if len(stolen) > 0 {
+            p.metrics.stealsSuccessful.Add(1)
+            p.metrics.localQueueSteals.Add(uint64(len(stolen)))
+            // Mark tasks as stolen
+            for _, g := range stolen {
+                g.SetSource(SourceStolen, victim.ID())
+            }
+            return stolen
+        }
+    }
+    return nil
+}
+
+// tryStealFromGlobalQueue attempts to steal from global queue
+func (p *Processor) tryStealFromGlobalQueue() []*Goroutine {
+    if p.globalQueue == nil {
+        return nil
+    }
+
+    stolen := p.globalQueue.TrySteal(p.maxQueueSize / 2)
+    if len(stolen) > 0 {
+        p.metrics.globalQueueSteals.Add(uint64(len(stolen)))
+        return stolen
+    }
+    return nil
+}
+
+// Execute runs a goroutine
+func (p *Processor) Execute(g *Goroutine) {
+    if g == nil {
+        return
+    }
+
+    p.currentG.Store(g)
+    defer p.currentG.Store(nil)
+
+    p.SetState(ProcessorRunning)
+
+    g.Start()
+    time.Sleep(g.Workload()) // Simulate execution
+    g.Finish(nil, nil)
+
+    p.metrics.tasksExecuted.Add(1)
+    p.SetState(ProcessorIdle)
+}
+
+// LocalRunQueue methods
+func (lrq *LocalRunQueue) push(g *Goroutine) bool {
+    lrq.mu.Lock()
+    defer lrq.mu.Unlock()
+
+    if lrq.count >= lrq.size {
+        return false
+    }
+
+    lrq.tasks = append(lrq.tasks, g)
+    lrq.count++
+    return true
+}
+
+func (lrq *LocalRunQueue) pop() *Goroutine {
+    lrq.mu.Lock()
+    defer lrq.mu.Unlock()
+
+    if lrq.count == 0 {
+        return nil
+    }
+
+    g := lrq.tasks[0]
+    lrq.tasks = lrq.tasks[1:]
+    lrq.count--
+    return g
+}
+
+func (lrq *LocalRunQueue) steal(n int) []*Goroutine {
+    lrq.mu.Lock()
+    defer lrq.mu.Unlock()
+
+    if n <= 0 || lrq.count == 0 {
+        return nil
+    }
+
+    if n > lrq.count {
+        n = lrq.count
+    }
+
+    stolen := make([]*Goroutine, n)
+    stealIndex := lrq.count - n
+    copy(stolen, lrq.tasks[stealIndex:])
+    lrq.tasks = lrq.tasks[:stealIndex]
+    lrq.count = stealIndex
+
+    return stolen
+}
+
+// GetStats returns current processor statistics
+func (p *Processor) GetStats() ProcessorStats {
+    p.mu.RLock()
+    defer p.mu.RUnlock()
+
+    return ProcessorStats{
+        ID:               p.id,
+        State:            p.State(),
+        CurrentTask:      p.currentG.Load(),
+        QueueSize:        p.localQueue.count,
+        TasksExecuted:    p.metrics.tasksExecuted.Load(),
+        StealsAttempted:  p.metrics.stealsAttempted.Load(),
+        StealsSuccessful: p.metrics.stealsSuccessful.Load(),
+        IdleTime:         time.Duration(p.metrics.totalIdleTime.Load()),
+        RunningTime:      time.Duration(p.metrics.totalRunningTime.Load()),
+        GlobalSteals:     p.metrics.globalQueueSteals.Load(),
+        LocalSteals:      p.metrics.localQueueSteals.Load(),
+        LastStateChange:  p.lastStateTime,
+    }
+}
+
+// QueueSize returns current local queue size
+func (p *Processor) QueueSize() int {
+    p.mu.RLock()
+    defer p.mu.RUnlock()
+    return p.localQueue.count
+}
+
+func (p *Processor) CurrentGoroutine() *Goroutine {
+    return p.currentG.Load()
+}
+
+func (s ProcessorState) String() string {
+    switch s {
+    case ProcessorIdle:
+        return "idle"
+    case ProcessorRunning:
+        return "running"
+    case ProcessorStealing:
+        return "stealing"
+    default:
+        return "unknown"
+    }
 }

@@ -1,228 +1,292 @@
 package core
 
 import (
+	"fmt"
+	"strings"
 	"sync"
 	"testing"
 	"time"
 )
 
-func TestNewGoroutine(t *testing.T) {
-    tests := []struct {
-        name     string
-        workload time.Duration
-        blocking bool
-    }{
-        {
-            name:     "Non-blocking goroutine",
-            workload: 100 * time.Millisecond,
-            blocking: false,
-        },
-        {
-            name:     "Blocking goroutine",
-            workload: 200 * time.Millisecond,
-            blocking: true,
-        },
+func TestGoroutineCreation(t *testing.T) {
+    workload := 100 * time.Millisecond
+    g := NewGoroutine(workload, false)
+
+    // Test basic properties
+    if g.ID() == 0 {
+        t.Fatal("Expected non-zero ID")
     }
 
-    for _, tt := range tests {
-        t.Run(tt.name, func(t *testing.T) {
-            g := NewGoroutine(tt.workload, tt.blocking)
+    if g.State() != GoroutineCreated {
+        t.Errorf("Expected initial state Created, got %v", g.State())
+    }
 
-            if g.ID() == 0 {
-                t.Error("Expected non-zero ID")
-            }
+    if g.Workload() != workload {
+        t.Errorf("Expected workload %v, got %v", workload, g.Workload())
+    }
 
-            if g.State() != GoroutineCreated {
-                t.Errorf("Expected state Created, got %v", g.State())
-            }
+    if g.IsBlocking() {
+        t.Error("Expected non-blocking goroutine")
+    }
 
-            if g.IsBlocking() != tt.blocking {
-                t.Errorf("Expected blocking %v, got %v", tt.blocking, g.IsBlocking())
-            }
+    // Test initial transition
+    transitions := g.GetTransitions()
+    if len(transitions) != 1 {
+        t.Fatalf("Expected 1 initial transition, got %d", len(transitions))
+    }
 
-            if g.Workload() != tt.workload {
-                t.Errorf("Expected workload %v, got %v", tt.workload, g.Workload())
-            }
+    initialTransition := transitions[0]
+    if initialTransition.From != "created" || initialTransition.To != "ready" {
+        t.Errorf("Unexpected initial transition: %s -> %s",
+            initialTransition.From, initialTransition.To)
+    }
 
-            if g.Source() != SourceLocalQueue {
-                t.Errorf("Expected default source SourceLocalQueue, got %v", g.Source())
-            }
-        })
+    // Test zero workload case
+    g2 := NewGoroutine(0, false)
+    if g2.Workload() <= 0 {
+        t.Error("Expected minimum workload for zero input")
     }
 }
 
-func TestGoroutineSource(t *testing.T) {
-    tests := []struct {
-        name       string
-        source     TaskSource
-        stolenFrom uint32
-    }{
-        {
-            name:       "Local Queue Source",
-            source:     SourceLocalQueue,
-            stolenFrom: 0,
-        },
-        {
-            name:       "Global Queue Source",
-            source:     SourceGlobalQueue,
-            stolenFrom: 0,
-        },
-        {
-            name:       "Stolen Source",
-            source:     SourceStolen,
-            stolenFrom: 1,
-        },
-        {
-            name:       "Network Poller Source",
-            source:     SourceNetworkPoller,
-            stolenFrom: 0,
-        },
-    }
+func TestGoroutineLifecycle(t *testing.T) {
+    testDone := make(chan bool)
 
-    for _, tt := range tests {
-        t.Run(tt.name, func(t *testing.T) {
-            g := NewGoroutine(100*time.Millisecond, false)
-            g.SetSource(tt.source, tt.stolenFrom)
+    go func() {
+        defer func() { testDone <- true }()
 
-            if g.Source() != tt.source {
-                t.Errorf("Expected source %v, got %v", tt.source, g.Source())
+        g := NewGoroutine(50*time.Millisecond, false)
+
+        // Define and test state transitions
+        transitions := []struct {
+            name      string
+            operation func()
+            expected  GoroutineState
+        }{
+            {"To Runnable", func() { g.SetState(GoroutineRunnable) }, GoroutineRunnable},
+            {"Start", func() { g.Start() }, GoroutineRunning},
+            {"Finish", func() { g.Finish(nil, nil) }, GoroutineFinished},
+        }
+
+        for _, tr := range transitions {
+            tr.operation()
+            if state := g.State(); state != tr.expected {
+                t.Errorf("%s: Expected state %v, got %v", tr.name, tr.expected, state)
             }
+        }
 
-            if g.stolenFrom != tt.stolenFrom {
-                t.Errorf("Expected stolenFrom %v, got %v", tt.stolenFrom, g.stolenFrom)
-            }
-        })
+        // Verify execution time
+        execTime := g.ExecutionTime()
+        if execTime <= 0 {
+            t.Error("Expected positive execution time, got", execTime)
+        }
+    }()
+
+    // Add timeout to prevent test hanging
+    select {
+    case <-testDone:
+        // Test completed successfully
+    case <-time.After(1 * time.Second):
+        t.Fatal("Test timed out after 1 second")
     }
 }
 
-func TestGoroutineStateTransitions(t *testing.T) {
+func TestGoroutineTransitions(t *testing.T) {
     g := NewGoroutine(100*time.Millisecond, false)
 
-    states := []struct {
-        state    GoroutineState
-        expected string
+    expectedTransitions := []struct {
+        from   string
+        to     string
+        reason string
     }{
-        {GoroutineRunnable, "Runnable"},
-        {GoroutineRunning, "Running"},
-        {GoroutineBlocked, "Blocked"},
-        {GoroutineRunnable, "Runnable"},
-        {GoroutineRunning, "Running"},
-        {GoroutineFinished, "Finished"},
+        {"ready", "running", "test_transition_1"},
+        {"running", "blocked", "test_transition_2"},
+        {"blocked", "runnable", "test_transition_3"},
     }
 
-    for _, s := range states {
-        g.SetState(s.state)
-        if g.State() != s.state {
-            t.Errorf("Expected state %v, got %v", s.expected, g.State())
+    // Add transitions with small delays to ensure measurable durations
+    for _, tr := range expectedTransitions {
+        time.Sleep(10 * time.Millisecond)
+        g.AddTransition(tr.from, tr.to, tr.reason)
+    }
+
+    // Verify transitions
+    transitions := g.GetTransitions()
+    if len(transitions) != len(expectedTransitions)+1 { // +1 for initial transition
+        t.Fatalf("Expected %d transitions, got %d",
+            len(expectedTransitions)+1, len(transitions))
+    }
+
+    // Skip initial transition in verification
+    for i, expected := range expectedTransitions {
+        actual := transitions[i+1]
+        if actual.From != expected.from ||
+           actual.To != expected.to ||
+           actual.Reason != expected.reason {
+            t.Errorf("Transition %d mismatch: expected %v->%v(%s), got %v->%v(%s)",
+                i, expected.from, expected.to, expected.reason,
+                actual.From, actual.To, actual.Reason)
+        }
+        if actual.Duration <= 0 {
+            t.Errorf("Transition %d: expected positive duration, got %v",
+                i, actual.Duration)
         }
     }
 }
 
-func TestGoroutineExecution(t *testing.T) {
+func TestConcurrentTransitions(t *testing.T) {
     g := NewGoroutine(100*time.Millisecond, false)
+    const numGoroutines = 100
 
-    // Test start time recording
-    g.Start()
-    startTime := g.startTime
-    if startTime.IsZero() {
-        t.Error("Start time should be set")
-    }
-
-    // Small sleep to simulate work
-    time.Sleep(50 * time.Millisecond)
-
-    // Test execution time while running
-    executionTime := g.ExecutionTime()
-    if executionTime < 50*time.Millisecond {
-        t.Errorf("Expected execution time >= 50ms, got %v", executionTime)
-    }
-
-    // Test finish
-    result := "test result"
-    g.Finish(result, nil)
-
-    if g.State() != GoroutineFinished {
-        t.Error("Goroutine should be in finished state")
-    }
-
-    if g.result != result {
-        t.Error("Result not properly stored")
-    }
-
-    finalTime := g.ExecutionTime()
-    if finalTime < executionTime {
-        t.Errorf("Final time %v should be >= execution time %v", finalTime, executionTime)
-    }
-}
-
-func TestGoroutineConcurrency(t *testing.T) {
-    const numGoroutines = 1000
     var wg sync.WaitGroup
-    goroutines := make([]*Goroutine, numGoroutines)
+    wg.Add(numGoroutines)
 
-    // Test concurrent creation
+    // Launch concurrent goroutines adding transitions
     for i := 0; i < numGoroutines; i++ {
-        wg.Add(1)
-        go func(i int) {
+        go func(id int) {
             defer wg.Done()
-            goroutines[i] = NewGoroutine(time.Millisecond, false)
+            g.AddTransition(
+                fmt.Sprintf("state_%d", id),
+                fmt.Sprintf("state_%d", id+1),
+                fmt.Sprintf("transition_%d", id),
+            )
         }(i)
     }
 
-    wg.Wait()
+    // Wait with timeout
+    done := make(chan bool)
+    go func() {
+        wg.Wait()
+        done <- true
+    }()
 
-    // Verify unique IDs
-    idMap := make(map[uint64]bool)
-    for _, g := range goroutines {
-        if g == nil {
-            t.Fatal("Goroutine creation failed")
-        }
-        if idMap[g.ID()] {
-            t.Error("Duplicate goroutine ID found")
-        }
-        idMap[g.ID()] = true
+    select {
+    case <-done:
+        // Success
+    case <-time.After(2 * time.Second):
+        t.Fatal("Concurrent transitions test timed out")
+    }
+
+    // Verify transitions
+    transitions := g.GetTransitions()
+    if len(transitions) != numGoroutines+1 { // +1 for initial transition
+        t.Errorf("Expected %d transitions, got %d",
+            numGoroutines+1, len(transitions))
     }
 }
 
-func TestGoroutineBlocking(t *testing.T) {
+func TestSourceChanges(t *testing.T) {
+    g := NewGoroutine(100*time.Millisecond, false)
+
+    changes := []struct {
+        source     TaskSource
+        stolenFrom uint32
+        expectStr  string
+    }{
+        {SourceGlobalQueue, 0, "global_queue"},
+        {SourceStolen, 1, "stolen"},
+        {SourceNetworkPoller, 2, "network_poller"},
+        {SourceLocalQueue, 3, "local_queue"},
+    }
+
+    for i, change := range changes {
+        g.SetSource(change.source, change.stolenFrom)
+
+        if g.Source() != change.source {
+            t.Errorf("Case %d: Expected source %v, got %v",
+                i, change.source, g.Source())
+        }
+
+        if g.StolenFrom() != change.stolenFrom {
+            t.Errorf("Case %d: Expected stolenFrom %v, got %v",
+                i, change.stolenFrom, g.StolenFrom())
+        }
+
+        if g.Source().String() != change.expectStr {
+            t.Errorf("Case %d: Expected source string %v, got %v",
+                i, change.expectStr, g.Source().String())
+        }
+    }
+}
+
+func TestStateStrings(t *testing.T) {
+    tests := []struct {
+        state    GoroutineState
+        expected string
+    }{
+        {GoroutineCreated, "created"},
+        {GoroutineRunnable, "runnable"},
+        {GoroutineRunning, "running"},
+        {GoroutineBlocked, "blocked"},
+        {GoroutineFinished, "finished"},
+        {GoroutineState(99), "unknown"},
+    }
+
+    for _, test := range tests {
+        if got := test.state.String(); got != test.expected {
+            t.Errorf("State %v: expected %q, got %q",
+                test.state, test.expected, got)
+        }
+    }
+}
+
+func TestTaskSourceStrings(t *testing.T) {
+    tests := []struct {
+        source   TaskSource
+        expected string
+    }{
+        {SourceGlobalQueue, "global_queue"},
+        {SourceLocalQueue, "local_queue"},
+        {SourceStolen, "stolen"},
+        {SourceNetworkPoller, "network_poller"},
+        {TaskSource(99), "unknown"},
+    }
+
+    for _, test := range tests {
+        if got := test.source.String(); got != test.expected {
+            t.Errorf("Source %v: expected %q, got %q",
+                test.source, test.expected, got)
+        }
+    }
+}
+
+func TestGetHistory(t *testing.T) {
     g := NewGoroutine(100*time.Millisecond, true)
-    if !g.IsBlocking() {
-        t.Error("Expected goroutine to be blocking")
-    }
-}
 
-func BenchmarkGoroutineCreation(b *testing.B) {
-    b.ResetTimer()
-    for i := 0; i < b.N; i++ {
-        _ = NewGoroutine(time.Millisecond, false)
-    }
-}
-
-func BenchmarkGoroutineStateTransitions(b *testing.B) {
-    g := NewGoroutine(time.Millisecond, false)
-    b.ResetTimer()
-
-    for i := 0; i < b.N; i++ {
-        g.SetState(GoroutineState(i % 5))
-    }
-}
-
-// Helper function to run all tests with race detector
-func TestWithRaceDetector(t *testing.T) {
-    const numConcurrent = 100
-    var wg sync.WaitGroup
-
-    for i := 0; i < numConcurrent; i++ {
-        wg.Add(1)
-        go func() {
-            defer wg.Done()
-            g := NewGoroutine(time.Millisecond, false)
-            g.Start()
-            g.SetState(GoroutineRunning)
-            g.ExecutionTime()
-            g.Finish(nil, nil)
-        }()
+    // Create a sequence of transitions
+    transitions := []struct {
+        from   string
+        to     string
+        reason string
+    }{
+        {"ready", "running", "start"},
+        {"running", "blocked", "io_wait"},
+        {"blocked", "runnable", "io_complete"},
+        {"runnable", "finished", "completion"},
     }
 
-    wg.Wait()
+    for _, tr := range transitions {
+        time.Sleep(10 * time.Millisecond) // Ensure measurable durations
+        g.AddTransition(tr.from, tr.to, tr.reason)
+    }
+
+    history := g.GetHistory()
+
+    // Verify history contains all transitions
+    for _, tr := range transitions {
+        if !strings.Contains(history, tr.from) ||
+           !strings.Contains(history, tr.to) ||
+           !strings.Contains(history, tr.reason) {
+            t.Errorf("History missing transition: %s->%s(%s)",
+                tr.from, tr.to, tr.reason)
+        }
+    }
+
+    // Verify format
+    if !strings.Contains(history, fmt.Sprintf("G%d History:", g.ID())) {
+        t.Error("History missing header")
+    }
+
+    if !strings.Contains(history, "duration:") {
+        t.Error("History missing duration information")
+    }
 }

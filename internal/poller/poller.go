@@ -8,7 +8,8 @@ import (
 	"workstealing/internal/core"
 )
 
-type EventType int
+// EventType represents different types of blocking events
+type EventType int32
 
 const (
     EventRead EventType = iota
@@ -17,39 +18,24 @@ const (
     EventError
 )
 
+const (
+    defaultEventBufferSize = 1000
+    timeoutCheckInterval  = 10 * time.Millisecond
+)
+
+// Event represents a blocking operation
 type Event struct {
-    Type      EventType
-    Goroutine *core.Goroutine
-    Result    interface{}
-    Error     error
-    Deadline  time.Time
-    Created   time.Time
-    ProcessorID uint32  // ID of the processor that submitted this task
+    ID          uint64
+    Type        EventType
+    Goroutine   *core.Goroutine
+    Result      interface{}
+    Error       error
+    Deadline    time.Time
+    Created     time.Time
+    ProcessorID uint32
 }
 
-type NetworkPoller struct {
-    events     map[uint64]*Event
-    processors []*core.Processor
-    mu         sync.RWMutex
-
-    metrics struct {
-        totalEvents     atomic.Uint64
-        completedEvents atomic.Uint64
-        timeouts        atomic.Uint64
-        errors          atomic.Uint64
-        avgBlockTime    atomic.Int64    // Average blocking time in nanoseconds
-        currentBlocked  atomic.Int32    // Number of currently blocked goroutines
-    }
-
-    // Track blocked goroutines and their details
-    blockedGoroutines map[uint64]*BlockedGoroutineInfo
-
-    wg      sync.WaitGroup
-    ctx     context.Context
-    cancel  context.CancelFunc
-    running atomic.Bool
-}
-
+// BlockedGoroutineInfo tracks details of blocked goroutines
 type BlockedGoroutineInfo struct {
     StartTime   time.Time
     EventType   EventType
@@ -57,6 +43,7 @@ type BlockedGoroutineInfo struct {
     Deadline    time.Time
 }
 
+// PollerMetrics represents runtime statistics
 type PollerMetrics struct {
     TotalEvents       uint64
     CompletedEvents   uint64
@@ -67,26 +54,64 @@ type PollerMetrics struct {
     ActiveEvents     int
 }
 
+// NetworkPoller manages blocking operations
+type NetworkPoller struct {
+    events     map[uint64]*Event            // Active events
+    processors []*core.Processor            // Available processors
+
+    metrics struct {
+        totalEvents     atomic.Uint64
+        completedEvents atomic.Uint64
+        timeouts        atomic.Uint64
+        errors         atomic.Uint64
+        avgBlockTime   atomic.Int64       // nanoseconds
+        currentBlocked atomic.Int32
+    }
+
+    blockedGoroutines map[uint64]*BlockedGoroutineInfo
+
+    eventCh  chan *Event          // Channel for new events
+    doneCh   chan uint64          // Channel for completed events
+
+    ctx      context.Context
+    cancel   context.CancelFunc
+    wg       sync.WaitGroup
+    running  atomic.Bool
+
+    mu       sync.RWMutex         // Protects maps and internal state
+}
+
+// NewNetworkPoller creates a new poller instance
 func NewNetworkPoller(processors []*core.Processor) *NetworkPoller {
+    if len(processors) == 0 {
+        return nil
+    }
+
     ctx, cancel := context.WithCancel(context.Background())
+
     return &NetworkPoller{
         events:            make(map[uint64]*Event),
         processors:        processors,
+        blockedGoroutines: make(map[uint64]*BlockedGoroutineInfo),
+        eventCh:          make(chan *Event, defaultEventBufferSize),
+        doneCh:           make(chan uint64, defaultEventBufferSize),
         ctx:              ctx,
         cancel:           cancel,
-        blockedGoroutines: make(map[uint64]*BlockedGoroutineInfo),
     }
 }
 
+// Start begins the polling operation
 func (np *NetworkPoller) Start() {
     if !np.running.CompareAndSwap(false, true) {
         return
     }
 
-    np.wg.Add(1)
-    go np.pollEvents()
+    np.wg.Add(2)
+    go np.eventLoop()
+    go np.timeoutChecker()
 }
 
+// Stop gracefully stops the poller
 func (np *NetworkPoller) Stop() {
     if !np.running.CompareAndSwap(true, false) {
         return
@@ -94,16 +119,32 @@ func (np *NetworkPoller) Stop() {
 
     np.cancel()
     np.wg.Wait()
-}
 
-func (np *NetworkPoller) Register(g *core.Goroutine, eventType EventType, deadline time.Time, processorID uint32) {
+    // Clean up remaining events
     np.mu.Lock()
     defer np.mu.Unlock()
 
-    np.metrics.totalEvents.Add(1)
-    np.metrics.currentBlocked.Add(1)
+    for id, event := range np.events {
+        np.handleTimeout(id, event)
+    }
 
-    np.events[g.ID()] = &Event{
+    // Clear channels
+    for len(np.eventCh) > 0 {
+        <-np.eventCh
+    }
+    for len(np.doneCh) > 0 {
+        <-np.doneCh
+    }
+}
+
+// Register adds a new blocking operation
+func (np *NetworkPoller) Register(g *core.Goroutine, eventType EventType, deadline time.Time, processorID uint32) {
+    if g == nil || !np.running.Load() {
+        return
+    }
+
+    event := &Event{
+        ID:          g.ID(),
         Type:        eventType,
         Goroutine:   g,
         Deadline:    deadline,
@@ -111,20 +152,94 @@ func (np *NetworkPoller) Register(g *core.Goroutine, eventType EventType, deadli
         ProcessorID: processorID,
     }
 
+    np.mu.Lock()
+    np.events[g.ID()] = event
     np.blockedGoroutines[g.ID()] = &BlockedGoroutineInfo{
-        StartTime:   time.Now(),
+        StartTime:   event.Created,
         EventType:   eventType,
         ProcessorID: processorID,
         Deadline:    deadline,
     }
+    np.mu.Unlock()
 
+    np.metrics.totalEvents.Add(1)
+    np.metrics.currentBlocked.Add(1)
     g.SetState(core.GoroutineBlocked)
+
+    select {
+    case np.eventCh <- event:
+    default:
+        // If channel is full, handle as timeout
+        np.handleTimeout(g.ID(), event)
+    }
 }
 
-func (np *NetworkPoller) pollEvents() {
+// eventLoop processes events
+func (np *NetworkPoller) eventLoop() {
     defer np.wg.Done()
 
-    ticker := time.NewTicker(time.Millisecond)
+    for {
+        select {
+        case <-np.ctx.Done():
+            return
+
+        case event := <-np.eventCh:
+            go np.processEvent(event)
+
+        case gid := <-np.doneCh:
+            np.completeEvent(gid)
+        }
+    }
+}
+
+// processEvent simulates I/O operation
+func (np *NetworkPoller) processEvent(event *Event) {
+    if event == nil {
+        return
+    }
+
+    simulatedWork := time.Duration(float64(event.Goroutine.Workload()) * 0.8)
+
+    select {
+    case <-np.ctx.Done():
+        return
+    case <-time.After(simulatedWork):
+        np.doneCh <- event.ID
+    }
+}
+
+// completeEvent handles event completion
+func (np *NetworkPoller) completeEvent(gid uint64) {
+    np.mu.Lock()
+    event, exists := np.events[gid]
+    if !exists {
+        np.mu.Unlock()
+        return
+    }
+
+    delete(np.events, gid)
+    delete(np.blockedGoroutines, gid)
+    np.mu.Unlock()
+
+    np.metrics.completedEvents.Add(1)
+    np.metrics.currentBlocked.Add(-1)
+
+    blockTime := time.Since(event.Created)
+    np.updateAverageBlockTime(blockTime)
+
+    event.Goroutine.SetState(core.GoroutineRunnable)
+    event.Goroutine.SetSource(core.SourceNetworkPoller, 0)
+
+    if processor := np.findLeastLoadedProcessor(); processor != nil {
+        processor.Push(event.Goroutine)
+    }
+}
+
+// timeoutChecker monitors for deadline expiration
+func (np *NetworkPoller) timeoutChecker() {
+    defer np.wg.Done()
+
+    ticker := time.NewTicker(timeoutCheckInterval)
     defer ticker.Stop()
 
     for {
@@ -132,57 +247,29 @@ func (np *NetworkPoller) pollEvents() {
         case <-np.ctx.Done():
             return
         case <-ticker.C:
-            np.checkEvents()
+            np.checkTimeouts()
         }
     }
 }
 
-func (np *NetworkPoller) checkEvents() {
+// checkTimeouts verifies deadlines
+func (np *NetworkPoller) checkTimeouts() {
     np.mu.Lock()
     defer np.mu.Unlock()
 
     now := time.Now()
     for id, event := range np.events {
-        // First check for timeout
         if now.After(event.Deadline) {
             np.handleTimeout(id, event)
-            continue
-        }
-
-        // Then check for completion
-        if np.shouldComplete(event, now) {
-            np.handleCompletion(id, event)
         }
     }
 }
 
-func (np *NetworkPoller) shouldComplete(event *Event, now time.Time) bool {
-    return now.Sub(event.Created) >= 50*time.Millisecond &&
-        now.Before(event.Deadline)
-}
-
-func (np *NetworkPoller) handleCompletion(id uint64, event *Event) {
-    delete(np.events, id)
-    np.metrics.completedEvents.Add(1)
-    np.metrics.currentBlocked.Add(-1)
-
-    // Calculate and update average block time
-    blockTime := time.Since(event.Created)
-    np.updateAverageBlockTime(blockTime)
-
-    event.Result = struct{}{} // Simulate result
-    event.Goroutine.SetState(core.GoroutineRunnable)
-    event.Goroutine.SetSource(core.SourceNetworkPoller, 0)
-
-    if processor := np.findLeastLoadedProcessor(); processor != nil {
-        processor.Push(event.Goroutine)
-    }
-
-    delete(np.blockedGoroutines, id)
-}
-
+// handleTimeout processes timeout events
 func (np *NetworkPoller) handleTimeout(id uint64, event *Event) {
     delete(np.events, id)
+    delete(np.blockedGoroutines, id)
+
     np.metrics.timeouts.Add(1)
     np.metrics.currentBlocked.Add(-1)
 
@@ -194,18 +281,16 @@ func (np *NetworkPoller) handleTimeout(id uint64, event *Event) {
     if processor := np.findLeastLoadedProcessor(); processor != nil {
         processor.Push(event.Goroutine)
     }
-
-    delete(np.blockedGoroutines, id)
 }
 
+// findLeastLoadedProcessor returns processor with minimum queue size
 func (np *NetworkPoller) findLeastLoadedProcessor() *core.Processor {
     var minLoad = int(^uint(0) >> 1)
     var target *core.Processor
 
     for _, p := range np.processors {
-        status := p.GetStatus()
-        if status.QueueSize < minLoad {
-            minLoad = status.QueueSize
+        if size := p.QueueSize(); size < minLoad {
+            minLoad = size
             target = p
         }
     }
@@ -213,19 +298,21 @@ func (np *NetworkPoller) findLeastLoadedProcessor() *core.Processor {
     return target
 }
 
+// updateAverageBlockTime updates running average of block times
 func (np *NetworkPoller) updateAverageBlockTime(blockTime time.Duration) {
     current := time.Duration(np.metrics.avgBlockTime.Load())
     completed := np.metrics.completedEvents.Load()
 
-    // Weighted average calculation
     if completed == 1 {
         np.metrics.avgBlockTime.Store(int64(blockTime))
-    } else {
-        newAvg := (current*time.Duration(completed-1) + blockTime) / time.Duration(completed)
-        np.metrics.avgBlockTime.Store(int64(newAvg))
+        return
     }
+
+    newAvg := (current*time.Duration(completed-1) + blockTime) / time.Duration(completed)
+    np.metrics.avgBlockTime.Store(int64(newAvg))
 }
 
+// GetMetrics returns current statistics
 func (np *NetworkPoller) GetMetrics() PollerMetrics {
     np.mu.RLock()
     activeEvents := len(np.events)
@@ -242,8 +329,24 @@ func (np *NetworkPoller) GetMetrics() PollerMetrics {
     }
 }
 
+// GetBlockedGoroutineInfo returns information about a blocked goroutine
 func (np *NetworkPoller) GetBlockedGoroutineInfo(id uint64) *BlockedGoroutineInfo {
     np.mu.RLock()
     defer np.mu.RUnlock()
     return np.blockedGoroutines[id]
+}
+
+func (et EventType) String() string {
+    switch et {
+    case EventRead:
+        return "read"
+    case EventWrite:
+        return "write"
+    case EventTimeout:
+        return "timeout"
+    case EventError:
+        return "error"
+    default:
+        return "unknown"
+    }
 }

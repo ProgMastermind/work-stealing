@@ -4,320 +4,294 @@ import (
 	"fmt"
 	"sync"
 	"time"
-	"workstealing/internal/core"
 	"workstealing/internal/scheduler"
 
-	"github.com/gizak/termui/v3"
+	ui "github.com/gizak/termui/v3"
 	"github.com/gizak/termui/v3/widgets"
 )
 
+type Event struct {
+    Timestamp time.Time
+    Message   string
+}
+
 type TerminalVisualizer struct {
-	scheduler      *scheduler.Scheduler
-	updateInterval time.Duration
-	mu             sync.RWMutex
-	stop           chan struct{}
+    scheduler      *scheduler.Scheduler
+    updateInterval time.Duration
+    mu            sync.RWMutex
+    stop          chan struct{}
 
-	// UI components
-	processorGauges []*widgets.Gauge
-	statsTable      *widgets.Table
-	taskGraph       *widgets.Plot
-	stealGraph      *widgets.Plot
-	statusBox       *widgets.Paragraph
-	queueBox        *widgets.Paragraph
+    // UI components
+    globalQueueBox  *widgets.Paragraph
+    processorBoxes  []*widgets.Paragraph
+    pollerBox      *widgets.Paragraph
+    eventBox       *widgets.List
 
-	// Historical data
-	taskHistory   []float64
-	stealHistory  []float64
-	globalHistory []float64
-	maxQueueSize  int
+    // Event tracking
+    events         []Event
+    maxEvents      int
 }
 
 func NewTerminalVisualizer(s *scheduler.Scheduler, interval time.Duration) (*TerminalVisualizer, error) {
-	if err := termui.Init(); err != nil {
-		return nil, fmt.Errorf("failed to initialize terminal UI: %v", err)
-	}
+    if err := ui.Init(); err != nil {
+        return nil, fmt.Errorf("failed to initialize terminal UI: %v", err)
+    }
 
-	tv := &TerminalVisualizer{
-		scheduler:      s,
-		updateInterval: interval,
-		stop:           make(chan struct{}),
-		taskHistory:    make([]float64, 100),
-		stealHistory:   make([]float64, 100),
-		globalHistory:  make([]float64, 100),
-		maxQueueSize:   100,
-	}
+    tv := &TerminalVisualizer{
+        scheduler:      s,
+        updateInterval: interval,
+        stop:          make(chan struct{}),
+        maxEvents:     10,
+        events:        make([]Event, 0, 10),
+    }
 
-	stats := s.GetStats()
-	if err := tv.initializeComponents(len(stats.ProcessorMetrics)); err != nil {
-		termui.Close()
-		return nil, fmt.Errorf("failed to initialize components: %v", err)
-	}
+    if err := tv.initializeComponents(); err != nil {
+        ui.Close()
+        return nil, fmt.Errorf("failed to initialize components: %v", err)
+    }
 
-	return tv, nil
+    return tv, nil
 }
 
-func (tv *TerminalVisualizer) initializeComponents(numProcessors int) error {
-	termWidth, termHeight := termui.TerminalDimensions()
-	gaugeHeight := 3
-	totalGaugeHeight := numProcessors * gaugeHeight
+func (tv *TerminalVisualizer) initializeComponents() error {
+    termWidth, termHeight := ui.TerminalDimensions()
 
-	// Initialize processor gauges
-	tv.processorGauges = make([]*widgets.Gauge, numProcessors)
-	for i := range tv.processorGauges {
-		tv.processorGauges[i] = widgets.NewGauge()
-		tv.processorGauges[i].Title = fmt.Sprintf("Processor %d", i)
-		tv.processorGauges[i].BarColor = getStateColor(core.ProcessorIdle)
-		tv.processorGauges[i].BorderStyle = BorderStyle
-		tv.processorGauges[i].TitleStyle = HeaderStyle
-		tv.processorGauges[i].SetRect(0, i*gaugeHeight, termWidth/2, (i*gaugeHeight)+3)
-	}
+    // Global Queue Box
+    tv.globalQueueBox = widgets.NewParagraph()
+    tv.globalQueueBox.Title = "Global Queue"
+    tv.globalQueueBox.SetRect(0, 0, termWidth, 4)
+    tv.globalQueueBox.BorderStyle.Fg = ui.ColorBlue
 
-	// Initialize statistics table
-	tv.statsTable = widgets.NewTable()
-	tv.statsTable.Title = "Scheduler Statistics"
-	tv.statsTable.BorderStyle = BorderStyle
-	tv.statsTable.TitleStyle = HeaderStyle
-	tv.statsTable.TextStyle = DefaultStyle
-	tv.statsTable.RowSeparator = true
-	tv.statsTable.SetRect(termWidth/2, 0, termWidth, totalGaugeHeight)
-	tv.statsTable.Rows = [][]string{
-		{"Metric", "Value"},
-		{"Tasks Scheduled", "0"},
-		{"Tasks Completed", "0"},
-		{"Total Steals", "0"},
-		{"Running Time", "0s"},
-	}
+    // Processor Boxes
+    stats := tv.scheduler.GetStats()
+    numProcessors := len(stats.ProcessorMetrics)
+    tv.processorBoxes = make([]*widgets.Paragraph, numProcessors)
 
-	// Initialize task distribution graph
-	tv.taskGraph = widgets.NewPlot()
-	tv.taskGraph.Title = "Task Distribution"
-	tv.taskGraph.BorderStyle = BorderStyle
-	tv.taskGraph.TitleStyle = HeaderStyle
-	tv.taskGraph.AxesColor = ColorScheme.GraphAxis
-	tv.taskGraph.LineColors = []termui.Color{ColorScheme.Success, ColorScheme.Warning}
-	tv.taskGraph.Data = [][]float64{tv.taskHistory}
-	tv.taskGraph.SetRect(0, totalGaugeHeight, termWidth/2, termHeight-totalGaugeHeight/2)
+    processorHeight := 5
+    processorsStartY := 4
 
-	// Initialize steal metrics graph
-	tv.stealGraph = widgets.NewPlot()
-	tv.stealGraph.Title = "Steal Activity"
-	tv.stealGraph.BorderStyle = BorderStyle
-	tv.stealGraph.TitleStyle = HeaderStyle
-	tv.stealGraph.AxesColor = ColorScheme.GraphAxis
-	tv.stealGraph.LineColors = []termui.Color{ColorScheme.Warning, ColorScheme.Error}
-	tv.stealGraph.Data = [][]float64{tv.stealHistory, tv.globalHistory}
-	tv.stealGraph.SetRect(0, termHeight-totalGaugeHeight/2, termWidth/2, termHeight)
+    for i := 0; i < numProcessors; i++ {
+        tv.processorBoxes[i] = widgets.NewParagraph()
+        tv.processorBoxes[i].Title = fmt.Sprintf("P%d", i)
+        tv.processorBoxes[i].SetRect(
+            0,
+            processorsStartY + (i * processorHeight),
+            termWidth,
+            processorsStartY + ((i + 1) * processorHeight),
+        )
+        tv.processorBoxes[i].BorderStyle.Fg = ui.ColorGreen
+    }
 
-	// Initialize status box
-	tv.statusBox = widgets.NewParagraph()
-	tv.statusBox.Title = "Processor Status"
-	tv.statusBox.BorderStyle = BorderStyle
-	tv.statusBox.TitleStyle = HeaderStyle
-	tv.statusBox.TextStyle = DefaultStyle
-	tv.statusBox.SetRect(termWidth/2, totalGaugeHeight, termWidth, termHeight-totalGaugeHeight/2)
+    // Network Poller Box
+    pollerStartY := processorsStartY + (numProcessors * processorHeight)
+    tv.pollerBox = widgets.NewParagraph()
+    tv.pollerBox.Title = "Network Poller"
+    tv.pollerBox.SetRect(0, pollerStartY, termWidth, pollerStartY + 4)
+    tv.pollerBox.BorderStyle.Fg = ui.ColorYellow
 
-	// Initialize queue box
-	tv.queueBox = widgets.NewParagraph()
-	tv.queueBox.Title = "Queue Status"
-	tv.queueBox.BorderStyle = BorderStyle
-	tv.queueBox.TitleStyle = HeaderStyle
-	tv.queueBox.TextStyle = DefaultStyle
-	tv.queueBox.SetRect(termWidth/2, termHeight-totalGaugeHeight/2, termWidth, termHeight)
+    // Event Box
+    eventStartY := pollerStartY + 4
+    tv.eventBox = widgets.NewList()
+    tv.eventBox.Title = "Recent Events"
+    tv.eventBox.SetRect(0, eventStartY, termWidth, termHeight)
+    tv.eventBox.BorderStyle.Fg = ui.ColorMagenta
 
-	return nil
+    return nil
 }
 
 func (tv *TerminalVisualizer) Start() {
-	go tv.updateLoop()
+    go tv.updateLoop()
 
-	uiEvents := termui.PollEvents()
-	for {
-		select {
-		case e := <-uiEvents:
-			switch e.ID {
-			case "q", "<C-c>":
-				tv.Stop()
-				return
-			case "<Resize>":
-				payload := e.Payload.(termui.Resize)
-				tv.handleResize(payload.Width, payload.Height)
-			}
-		case <-tv.stop:
-			return
-		}
-	}
+    uiEvents := ui.PollEvents()
+    for {
+        select {
+        case e := <-uiEvents:
+            switch e.ID {
+            case "q", "<C-c>":
+                tv.Stop()
+                return
+            case "<Resize>":
+                payload := e.Payload.(ui.Resize)
+                tv.handleResize(payload.Width, payload.Height)
+            }
+        case <-tv.stop:
+            return
+        }
+    }
 }
 
 func (tv *TerminalVisualizer) Stop() {
-	close(tv.stop)
-	termui.Close()
+    close(tv.stop)
+    ui.Close()
 }
 
 func (tv *TerminalVisualizer) updateLoop() {
-	ticker := time.NewTicker(tv.updateInterval)
-	defer ticker.Stop()
+    ticker := time.NewTicker(tv.updateInterval)
+    defer ticker.Stop()
 
-	for {
-		select {
-		case <-ticker.C:
-			tv.update()
-		case <-tv.stop:
-			return
-		}
-	}
+    for {
+        select {
+        case <-ticker.C:
+            tv.update()
+        case <-tv.stop:
+            return
+        }
+    }
 }
 
 func (tv *TerminalVisualizer) update() {
-	tv.mu.Lock()
-	defer tv.mu.Unlock()
+    tv.mu.Lock()
+    defer tv.mu.Unlock()
 
-	stats := tv.scheduler.GetStats()
+    stats := tv.scheduler.GetStats()
 
-	// Update processor gauges and status
-	for i, metrics := range stats.ProcessorMetrics {
-		tv.updateProcessorGauge(i, metrics)
-	}
+    // Update Global Queue
+    tv.updateGlobalQueue(stats)
 
-	// Update statistics
-	tv.updateStatsTable(stats)
+    // Update Processors
+    tv.updateProcessors(stats)
 
-	// Update graphs
-	tv.updateGraphs(stats)
+    // Update Network Poller
+    tv.updateNetworkPoller(stats)
 
-	// Update status boxes
-	tv.updateStatusBox(stats)
-	tv.updateQueueBox(stats)
-
-	tv.render()
+    // Render everything
+    tv.render()
 }
 
-func (tv *TerminalVisualizer) updateProcessorGauge(index int, metrics core.ProcessorMetricsData) {
-	gauge := tv.processorGauges[index]
-	utilization := int((float64(metrics.TasksExecuted) / float64(tv.maxQueueSize)) * 100)
-	if utilization > 100 {
-		utilization = 100
-	}
-
-	gauge.Percent = utilization
-	gauge.Label = fmt.Sprintf("[Steals L/G: %d/%d](fg:yellow) [Tasks: %d](fg:green)",
-		metrics.LocalQueueSteals,
-		metrics.GlobalQueueSteals,
-		metrics.TasksExecuted)
+func (tv *TerminalVisualizer) updateGlobalQueue(stats scheduler.SchedulerStats) {
+    gqStats := stats.GlobalQueueStats
+    tv.globalQueueBox.Text = fmt.Sprintf(
+        "Size: %d/%d\n"+
+        "Tasks Scheduled: %d  Completed: %d\n"+
+        "Utilization: %.1f%%",
+        gqStats.CurrentSize,
+        gqStats.Capacity,
+        gqStats.Submitted,
+        gqStats.Executed,
+        gqStats.Utilization*100,
+    )
 }
 
-func (tv *TerminalVisualizer) updateStatsTable(stats scheduler.SchedulerStats) {
-	tv.statsTable.Rows = [][]string{
-		{"Metric", "Value"},
-		{"Tasks Scheduled", fmt.Sprintf("%d", stats.TasksScheduled)},
-		{"Tasks Completed", fmt.Sprintf("%d", stats.TasksCompleted)},
-		{"Local Steals", fmt.Sprintf("%d", stats.LocalQueueSteals)},
-		{"Global Steals", fmt.Sprintf("%d", stats.GlobalQueueSteals)},
-		{"Running Time", stats.RunningTime.String()},
-	}
+func (tv *TerminalVisualizer) updateProcessors(stats scheduler.SchedulerStats) {
+    for i, pStats := range stats.ProcessorMetrics {
+        currentTask := "Idle"
+        if pStats.CurrentTask != nil {
+            currentTask = fmt.Sprintf("G%d (%s)",
+                pStats.CurrentTask.ID(),
+                pStats.State.String(),
+            )
+        }
+
+        tv.processorBoxes[i].Text = fmt.Sprintf(
+            "State: %s\n"+
+            "Current: %s\n"+
+            "Queue Size: %d\n"+
+            "Steals (L/G): %d/%d",
+            pStats.State,
+            currentTask,
+            pStats.QueueSize,
+            pStats.LocalSteals,
+            pStats.GlobalSteals,
+        )
+    }
 }
 
-func (tv *TerminalVisualizer) updateGraphs(stats scheduler.SchedulerStats) {
-	// Update task history
-	copy(tv.taskHistory[1:], tv.taskHistory)
-	tv.taskHistory[0] = float64(stats.TasksCompleted)
-
-	// Update steal history
-	copy(tv.stealHistory[1:], tv.stealHistory)
-	tv.stealHistory[0] = float64(stats.LocalQueueSteals)
-
-	// Update global steal history
-	copy(tv.globalHistory[1:], tv.globalHistory)
-	tv.globalHistory[0] = float64(stats.GlobalQueueSteals)
-
-	tv.taskGraph.Data = [][]float64{tv.taskHistory}
-	tv.stealGraph.Data = [][]float64{tv.stealHistory, tv.globalHistory}
+func (tv *TerminalVisualizer) updateNetworkPoller(stats scheduler.SchedulerStats) {
+    pollerMetrics := stats.PollerMetrics
+    tv.pollerBox.Text = fmt.Sprintf(
+        "Currently Blocked: %d\n"+
+        "Completed: %d  Timeouts: %d  Errors: %d\n"+
+        "Average Block Time: %v",
+        pollerMetrics.CurrentlyBlocked,
+        pollerMetrics.CompletedEvents,
+        pollerMetrics.Timeouts,
+        pollerMetrics.Errors,
+        pollerMetrics.AverageBlockTime,
+    )
 }
 
-func (tv *TerminalVisualizer) updateStatusBox(stats scheduler.SchedulerStats) {
-	var totalIdleTime, totalRunningTime time.Duration
-	for _, pm := range stats.ProcessorMetrics {
-		totalIdleTime += pm.TotalIdleTime
-		totalRunningTime += pm.TotalRunningTime
-	}
+func (tv *TerminalVisualizer) AddEvent(msg string) {
+    tv.mu.Lock()
+    defer tv.mu.Unlock()
 
-	tv.statusBox.Text = fmt.Sprintf(
-		"Processors: %d\n"+
-			"Total Idle Time: %v\n"+
-			"Total Running Time: %v\n"+
-			"Tasks Completed: %d\n"+
-			"Steal Ratio: %.2f%%",
-		len(stats.ProcessorMetrics),
-		totalIdleTime,
-		totalRunningTime,
-		stats.TasksCompleted,
-		float64(stats.TotalSteals)/float64(stats.TasksCompleted)*100,
-	)
+    event := Event{
+        Timestamp: time.Now(),
+        Message:   msg,
+    }
+
+    // Add to front
+    tv.events = append([]Event{event}, tv.events...)
+
+    // Maintain max size
+    if len(tv.events) > tv.maxEvents {
+        tv.events = tv.events[:tv.maxEvents]
+    }
+
+    // Update display
+    tv.updateEventDisplay()
 }
 
-func (tv *TerminalVisualizer) updateQueueBox(stats scheduler.SchedulerStats) {
-	gqs := stats.GlobalQueueStats
-	tv.queueBox.Text = fmt.Sprintf(
-		"Global Queue:\n"+
-			"Size: %d/%d\n"+
-			"Submitted: %d\n"+
-			"Rejected: %d\n"+
-			"Utilization: %.2f%%",
-		gqs.CurrentSize,
-		gqs.Capacity,
-		gqs.Submitted,
-		gqs.Rejected,
-		gqs.Utilization*100,
-	)
+func (tv *TerminalVisualizer) updateEventDisplay() {
+    rows := make([]string, len(tv.events))
+    now := time.Now()
+
+    for i, event := range tv.events {
+        duration := now.Sub(event.Timestamp)
+        rows[i] = fmt.Sprintf("[%s ago] %s",
+            formatDuration(duration),
+            event.Message,
+        )
+    }
+
+    tv.eventBox.Rows = rows
 }
 
 func (tv *TerminalVisualizer) render() {
-	termui.Clear()
+    ui.Render(
+        tv.globalQueueBox,
+        tv.pollerBox,
+        tv.eventBox,
+    )
 
-	// Render all components
-	for _, gauge := range tv.processorGauges {
-		termui.Render(gauge)
-	}
-
-	termui.Render(
-		tv.statsTable,
-		tv.taskGraph,
-		tv.stealGraph,
-		tv.statusBox,
-		tv.queueBox,
-	)
+    for _, box := range tv.processorBoxes {
+        ui.Render(box)
+    }
 }
 
 func (tv *TerminalVisualizer) handleResize(width, height int) {
-	if width <= 0 || height <= 0 {
-		return
-	}
+    tv.mu.Lock()
+    defer tv.mu.Unlock()
 
-	tv.mu.Lock()
-	defer tv.mu.Unlock()
+    // Recalculate component dimensions
+    tv.globalQueueBox.SetRect(0, 0, width, 4)
 
-	gaugeHeight := 3
-	numProcessors := len(tv.processorGauges)
-	totalGaugeHeight := numProcessors * gaugeHeight
+    processorHeight := 5
+    processorsStartY := 4
 
-	// Resize processor gauges
-	for i, gauge := range tv.processorGauges {
-		gauge.SetRect(0, i*gaugeHeight, width/2, (i*gaugeHeight)+3)
-	}
+    for i := range tv.processorBoxes {
+        tv.processorBoxes[i].SetRect(
+            0,
+            processorsStartY + (i * processorHeight),
+            width,
+            processorsStartY + ((i + 1) * processorHeight),
+        )
+    }
 
-	// Resize stats table
-	tv.statsTable.SetRect(width/2, 0, width, totalGaugeHeight)
+    pollerStartY := processorsStartY + (len(tv.processorBoxes) * processorHeight)
+    tv.pollerBox.SetRect(0, pollerStartY, width, pollerStartY + 4)
 
-	// Resize task graph
-	tv.taskGraph.SetRect(0, totalGaugeHeight, width/2, height-totalGaugeHeight/2)
+    eventStartY := pollerStartY + 4
+    tv.eventBox.SetRect(0, eventStartY, width, height)
 
-	// Resize steal graph
-	tv.stealGraph.SetRect(0, height-totalGaugeHeight/2, width/2, height)
+    tv.render()
+}
 
-	// Resize status box
-	tv.statusBox.SetRect(width/2, totalGaugeHeight, width, height-totalGaugeHeight/2)
-
-	// Resize queue box
-	tv.queueBox.SetRect(width/2, height-totalGaugeHeight/2, width, height)
-
-	tv.render()
+func formatDuration(d time.Duration) string {
+    if d < time.Second {
+        return "now"
+    }
+    if d < time.Minute {
+        return fmt.Sprintf("%ds", int(d.Seconds()))
+    }
+    return fmt.Sprintf("%dm%ds", int(d.Minutes()), int(d.Seconds())%60)
 }

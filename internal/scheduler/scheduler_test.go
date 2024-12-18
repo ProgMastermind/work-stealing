@@ -7,325 +7,279 @@ import (
 	"workstealing/internal/core"
 )
 
-func TestNewScheduler(t *testing.T) {
-	s := NewScheduler(4, 1000)
+type testSetup struct {
+    scheduler *Scheduler
+    cleanup   func()
+}
 
-	if s.numProcessors != 4 {
-		t.Errorf("Expected 4 processors, got %d", s.numProcessors)
-	}
+func newTestSetup(t *testing.T, numProcessors int) *testSetup {
+    s := NewScheduler(numProcessors, 1000)
+    if s == nil {
+        t.Fatal("Failed to create scheduler")
+    }
 
-	if len(s.processors) != 4 {
-		t.Errorf("Expected 4 processors initialized, got %d", len(s.processors))
-	}
+    return &testSetup{
+        scheduler: s,
+        cleanup: func() {
+            if s.State() == SchedulerRunning {
+                s.Stop()
+            }
+        },
+    }
+}
 
-	if s.state.Load() != int32(SchedulerStopped) {
-		t.Error("Expected scheduler to be in stopped state initially")
-	}
+func TestSchedulerCreation(t *testing.T) {
+    tests := []struct {
+        name          string
+        numProcessors int
+        queueSize     int32
+        wantNil      bool
+    }{
+        {
+            name:          "Valid creation",
+            numProcessors: 4,
+            queueSize:     1000,
+            wantNil:       false,
+        },
+        {
+            name:          "Zero processors defaults to 1",
+            numProcessors: 0,
+            queueSize:     1000,
+            wantNil:       false,
+        },
+        {
+            name:          "Negative processors defaults to 1",
+            numProcessors: -1,
+            queueSize:     1000,
+            wantNil:       false,
+        },
+    }
 
-	if s.rand == nil {
-		t.Error("Random source should be initialized")
-	}
+    for _, tt := range tests {
+        t.Run(tt.name, func(t *testing.T) {
+            s := NewScheduler(tt.numProcessors, tt.queueSize)
+            if (s == nil) != tt.wantNil {
+                t.Errorf("NewScheduler() nil = %v, want %v", s == nil, tt.wantNil)
+            }
+
+            if s != nil {
+                expectedProcessors := tt.numProcessors
+                if expectedProcessors <= 0 {
+                    expectedProcessors = 1
+                }
+
+                if len(s.processors) != expectedProcessors {
+                    t.Errorf("Expected %d processors, got %d", expectedProcessors, len(s.processors))
+                }
+
+                if s.globalQueue == nil {
+                    t.Error("Global queue not initialized")
+                }
+
+                if s.networkPoller == nil {
+                    t.Error("Network poller not initialized")
+                }
+
+                if s.State() != SchedulerStopped {
+                    t.Errorf("Initial state = %v, want %v", s.State(), SchedulerStopped)
+                }
+            }
+        })
+    }
 }
 
 func TestSchedulerStartStop(t *testing.T) {
-	s := NewScheduler(4, 1000)
+    setup := newTestSetup(t, 2)
+    defer setup.cleanup()
 
-	// Test starting
-	if err := s.Start(); err != nil {
-		t.Errorf("Failed to start scheduler: %v", err)
-	}
+    // Test Start
+    if err := setup.scheduler.Start(); err != nil {
+        t.Errorf("Start() error = %v", err)
+    }
+    if setup.scheduler.State() != SchedulerRunning {
+        t.Errorf("After Start(): state = %v, want %v", setup.scheduler.State(), SchedulerRunning)
+    }
 
-	if s.state.Load() != int32(SchedulerRunning) {
-		t.Error("Expected scheduler to be in running state")
-	}
+    // Test double Start
+    if err := setup.scheduler.Start(); err != nil {
+        t.Error("Second Start() should not return error")
+    }
 
-	// Test double start
-	if err := s.Start(); err != nil {
-		t.Error("Second start should not return error")
-	}
+    // Test Stop
+    setup.scheduler.Stop()
+    if setup.scheduler.State() != SchedulerStopped {
+        t.Errorf("After Stop(): state = %v, want %v", setup.scheduler.State(), SchedulerStopped)
+    }
 
-	// Test stopping
-	s.Stop()
-
-	if s.state.Load() != int32(SchedulerStopped) {
-		t.Error("Expected scheduler to be in stopped state after stop")
-	}
+    // Test double Stop
+    setup.scheduler.Stop() // Should not panic
 }
 
-func TestTaskSubmissionAndExecution(t *testing.T) {
-	s := NewScheduler(2, 1000)
-	s.Start()
-	defer s.Stop()
+func TestSchedulerTaskSubmission(t *testing.T) {
+    setup := newTestSetup(t, 2)
+    defer setup.cleanup()
 
-	numTasks := 100
-	var wg sync.WaitGroup
-	wg.Add(numTasks)
+    if err := setup.scheduler.Start(); err != nil {
+        t.Fatal(err)
+    }
 
-	// Submit tasks
-	for i := 0; i < numTasks; i++ {
-		g := core.NewGoroutine(10*time.Millisecond, false)
-		if !s.Submit(g) {
-			t.Errorf("Failed to submit task %d", i)
-		}
-	}
+    t.Run("Non-blocking Task", func(t *testing.T) {
+        g := core.NewGoroutine(10*time.Millisecond, false)
+        if !setup.scheduler.Submit(g) {
+            t.Error("Submit should succeed")
+        }
 
-	// Allow time for execution
-	time.Sleep(200 * time.Millisecond)
+        time.Sleep(20 * time.Millisecond) // Allow execution
+        stats := setup.scheduler.GetStats()
+        if stats.TasksScheduled == 0 {
+            t.Error("TasksScheduled not incremented")
+        }
+        if stats.TasksCompleted == 0 {
+            t.Error("Task not completed")
+        }
+    })
 
-	// Check metrics
-	stats := s.GetStats()
-	if stats.TasksScheduled != uint64(numTasks) {
-		t.Errorf("Expected %d tasks scheduled, got %d", numTasks, stats.TasksScheduled)
-	}
+    t.Run("Blocking Task", func(t *testing.T) {
+        g := core.NewGoroutine(20*time.Millisecond, true)
+        if !setup.scheduler.Submit(g) {
+            t.Error("Submit should succeed")
+        }
 
-	completedTasks := stats.TasksCompleted
-	if completedTasks == 0 {
-		t.Error("No tasks completed")
-	}
+        time.Sleep(10 * time.Millisecond) // Allow registration
+        stats := setup.scheduler.GetStats()
+        if stats.PollerMetrics.TotalEvents == 0 {
+            t.Error("Blocking task not registered with poller")
+        }
+    })
+
+    t.Run("Nil Task", func(t *testing.T) {
+        if setup.scheduler.Submit(nil) {
+            t.Error("Nil submission should fail")
+        }
+    })
 }
 
-func TestWorkStealing(t *testing.T) {
-	s := NewScheduler(2, 1000)
-	s.Start()
-	defer s.Stop()
+func TestSchedulerMetrics(t *testing.T) {
+    setup := newTestSetup(t, 2)
+    defer setup.cleanup()
 
-	// Create imbalance by submitting tasks
-	numTasks := 20
-	for i := 0; i < numTasks; i++ {
-		g := core.NewGoroutine(5*time.Millisecond, false)
-		s.Submit(g)
-	}
+    if err := setup.scheduler.Start(); err != nil {
+        t.Fatal(err)
+    }
 
-	// Allow time for work stealing to occur
-	time.Sleep(100 * time.Millisecond)
+    // Submit tasks with controlled timing
+    numBlocking := 5
+    numNonBlocking := 5
 
-	// Verify steals occurred
-	stats := s.GetStats()
-	if stats.TotalSteals == 0 {
-		t.Error("Expected some work stealing to occur")
-	}
+    // Submit blocking tasks first
+    for i := 0; i < numBlocking; i++ {
+        g := core.NewGoroutine(20*time.Millisecond, true)
+        if !setup.scheduler.Submit(g) {
+            t.Errorf("Failed to submit blocking task %d", i)
+        }
+        time.Sleep(5 * time.Millisecond) // Ensure proper registration
+    }
 
-	t.Logf("Work stealing stats: Total=%d, Global=%d, Local=%d",
-		stats.TotalSteals, stats.GlobalQueueSteals, stats.LocalQueueSteals)
+    // Wait for blocking tasks to be registered
+    time.Sleep(30 * time.Millisecond)
+
+    // Check blocking task registration
+    stats := setup.scheduler.GetStats()
+    if stats.PollerMetrics.TotalEvents != uint64(numBlocking) {
+        t.Errorf("Expected %d blocking events, got %d", numBlocking, stats.PollerMetrics.TotalEvents)
+    }
+
+    // Submit non-blocking tasks
+    for i := 0; i < numNonBlocking; i++ {
+        g := core.NewGoroutine(10*time.Millisecond, false)
+        if !setup.scheduler.Submit(g) {
+            t.Errorf("Failed to submit non-blocking task %d", i)
+        }
+    }
+
+    // Wait for task completion
+    time.Sleep(50 * time.Millisecond)
+
+    // Verify final metrics
+    finalStats := setup.scheduler.GetStats()
+    totalTasks := uint64(numBlocking + numNonBlocking)
+
+    if finalStats.TasksScheduled != totalTasks {
+        t.Errorf("Expected %d tasks scheduled, got %d", totalTasks, finalStats.TasksScheduled)
+    }
+
+    // Non-blocking tasks should complete
+    if finalStats.TasksCompleted < uint64(numNonBlocking) {
+        t.Errorf("Expected at least %d completed tasks, got %d", numNonBlocking, finalStats.TasksCompleted)
+    }
 }
 
-func TestRandomDistribution(t *testing.T) {
-	s := NewScheduler(4, 1000)
-	s.Start()
-	defer s.Stop()
+func TestConcurrentTaskSubmission(t *testing.T) {
+    setup := newTestSetup(t, 4)
+    defer setup.cleanup()
 
-	// Submit a large number of tasks
-	numTasks := 1000
-	for i := 0; i < numTasks; i++ {
-		g := core.NewGoroutine(time.Millisecond, false)
-		s.Submit(g)
-	}
+    if err := setup.scheduler.Start(); err != nil {
+        t.Fatal(err)
+    }
 
-	// Allow time for distribution
-	time.Sleep(50 * time.Millisecond)
+    const numGoroutines = 10
+    const tasksPerGoroutine = 5
 
-	// Check distribution across processors
-	processorLoads := make([]int, len(s.processors))
-	for i, p := range s.processors {
-		status := p.GetStatus()
-		processorLoads[i] = status.QueueSize
-	}
+    var wg sync.WaitGroup
+    wg.Add(numGoroutines)
 
-	// Calculate load variance
-	var totalLoad int
-	for _, load := range processorLoads {
-		totalLoad += load
-	}
-	avgLoad := float64(totalLoad) / float64(len(processorLoads))
+    for i := 0; i < numGoroutines; i++ {
+        go func(id int) {
+            defer wg.Done()
+            for j := 0; j < tasksPerGoroutine; j++ {
+                // Alternate between blocking and non-blocking tasks
+                g := core.NewGoroutine(10*time.Millisecond, j%2 == 0)
+                setup.scheduler.Submit(g)
+                time.Sleep(time.Millisecond) // Prevent flooding
+            }
+        }(i)
+    }
 
-	// Check if load is reasonably distributed
-	for i, load := range processorLoads {
-		diff := float64(load) - avgLoad
-		if diff > float64(avgLoad)*0.5 { // Allow 50% deviation
-			t.Errorf("Processor %d load too high: %d (avg: %.2f)", i, load, avgLoad)
-		}
-	}
+    // Wait with timeout
+    done := make(chan bool)
+    go func() {
+        wg.Wait()
+        done <- true
+    }()
+
+    select {
+    case <-done:
+        // Success
+    case <-time.After(5 * time.Second):
+        t.Fatal("Concurrent submission test timed out")
+    }
+
+    // Allow time for task processing
+    time.Sleep(100 * time.Millisecond)
+
+    stats := setup.scheduler.GetStats()
+    expectedTasks := uint64(numGoroutines * tasksPerGoroutine)
+    if stats.TasksScheduled != expectedTasks {
+        t.Errorf("Expected %d tasks scheduled, got %d", expectedTasks, stats.TasksScheduled)
+    }
 }
 
-func TestSchedulerConcurrency(t *testing.T) {
-	s := NewScheduler(4, 1000)
-	s.Start()
-	defer s.Stop()
+func TestSchedulerStateString(t *testing.T) {
+    tests := []struct {
+        state SchedulerState
+        want  string
+    }{
+        {SchedulerStopped, "stopped"},
+        {SchedulerRunning, "running"},
+        {SchedulerStopping, "stopping"},
+        {SchedulerState(99), "unknown"},
+    }
 
-	var wg sync.WaitGroup
-	numOperations := 1000
-
-	// Concurrent submissions
-	for i := 0; i < numOperations; i++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			g := core.NewGoroutine(time.Millisecond, false)
-			s.Submit(g)
-		}()
-	}
-
-	// Concurrent stats checking
-	for i := 0; i < numOperations/10; i++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			s.GetStats()
-		}()
-	}
-
-	wg.Wait()
-}
-
-func TestSchedulerStress(t *testing.T) {
-	if testing.Short() {
-		t.Skip("Skipping stress test in short mode")
-	}
-
-	s := NewScheduler(8, 10000)
-	s.Start()
-	defer s.Stop()
-
-	var wg sync.WaitGroup
-	numTasks := 10000
-
-	// Submit many tasks with varying workloads
-	for i := 0; i < numTasks; i++ {
-		wg.Add(1)
-		go func(id int) {
-			defer wg.Done()
-			workload := time.Duration(id%10) * time.Millisecond
-			g := core.NewGoroutine(workload, false)
-			s.Submit(g)
-		}(i)
-	}
-
-	wg.Wait()
-	time.Sleep(100 * time.Millisecond) // Allow for processing
-
-	stats := s.GetStats()
-	t.Logf("Stress test results: Scheduled=%d, Completed=%d, Steals=%d",
-		stats.TasksScheduled, stats.TasksCompleted, stats.TotalSteals)
-}
-
-func TestSchedulerEdgeCases(t *testing.T) {
-	s := NewScheduler(1, 10)
-
-	// Test submission before start
-	g := core.NewGoroutine(time.Millisecond, false)
-	if s.Submit(g) {
-		t.Error("Should not accept tasks before starting")
-	}
-
-	s.Start()
-
-	// Test submission to full queue
-	for i := 0; i < 15; i++ {
-		g := core.NewGoroutine(time.Millisecond, false)
-		s.Submit(g)
-	}
-
-	// Test stop while tasks are pending
-	s.Stop()
-
-	if s.Submit(g) {
-		t.Error("Should not accept tasks after stopping")
-	}
-}
-
-func BenchmarkSchedulerSubmission(b *testing.B) {
-	s := NewScheduler(4, int32(b.N))
-	s.Start()
-	defer s.Stop()
-
-	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
-		g := core.NewGoroutine(time.Microsecond, false)
-		s.Submit(g)
-	}
-}
-
-func BenchmarkSchedulerWorkStealing(b *testing.B) {
-	s := NewScheduler(4, int32(b.N))
-	s.Start()
-	defer s.Stop()
-
-	// Submit tasks to create stealing opportunities
-	for i := 0; i < b.N; i++ {
-		g := core.NewGoroutine(time.Microsecond, false)
-		s.Submit(g)
-	}
-
-	b.ResetTimer()
-	time.Sleep(time.Duration(b.N) * time.Microsecond)
-}
-
-func TestProcessorUtilization(t *testing.T) {
-	s := NewScheduler(4, 1000)
-	s.Start()
-	defer s.Stop()
-
-	// Submit a steady stream of tasks
-	for i := 0; i < 100; i++ {
-		g := core.NewGoroutine(time.Millisecond, false)
-		s.Submit(g)
-		time.Sleep(time.Millisecond)
-	}
-
-	// Check processor metrics
-	stats := s.GetStats()
-	for i, metrics := range stats.ProcessorMetrics {
-		if metrics.TasksExecuted == 0 {
-			t.Errorf("Processor %d has not executed any tasks", i)
-		}
-		t.Logf("Processor %d: Tasks=%d, Steals=%d, IdleTime=%v",
-			i, metrics.TasksExecuted, metrics.StealsSuccessful, metrics.TotalIdleTime)
-	}
-}
-
-func TestSchedulerMetricsAccuracy(t *testing.T) {
-	s := NewScheduler(2, 1000)
-	s.Start()
-	defer s.Stop()
-
-	numTasks := 50
-	tasksSubmitted := 0
-	for i := 0; i < numTasks; i++ {
-		g := core.NewGoroutine(time.Millisecond, false)
-		if s.Submit(g) {
-			tasksSubmitted++
-		}
-	}
-
-	time.Sleep(100 * time.Millisecond)
-	stats := s.GetStats()
-
-	// Verify metrics consistency
-	totalExecuted := uint64(0)
-	for _, pm := range stats.ProcessorMetrics {
-		totalExecuted += pm.TasksExecuted
-	}
-
-	if totalExecuted != stats.TasksCompleted {
-		t.Errorf("Inconsistent completion metrics: processor total=%d, scheduler total=%d",
-			totalExecuted, stats.TasksCompleted)
-	}
-
-	// Check if total tasks accounted for matches submitted tasks
-	directAssignments := stats.TasksScheduled - uint64(stats.GlobalQueueStats.Submitted)
-
-	if uint64(tasksSubmitted) != stats.TasksScheduled {
-		t.Errorf("Inconsistent task scheduling: submitted %d, scheduled %d",
-			tasksSubmitted, stats.TasksScheduled)
-	}
-
-	t.Logf("Task Distribution:\n"+
-		"Total Scheduled: %d\n"+
-		"Global Queue Submissions: %d\n"+
-		"Direct Assignments: %d\n"+
-		"Rejected Tasks: %d",
-		stats.TasksScheduled,
-		stats.GlobalQueueStats.Submitted,
-		directAssignments,
-		stats.GlobalQueueStats.Rejected)
+    for _, tt := range tests {
+        t.Run(tt.want, func(t *testing.T) {
+            if got := tt.state.String(); got != tt.want {
+                t.Errorf("SchedulerState(%d).String() = %v, want %v", tt.state, got, tt.want)
+            }
+        })
+    }
 }

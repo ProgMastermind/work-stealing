@@ -197,16 +197,6 @@ func (p *Processor) selectVictim() *Processor {
 		}
 	}
 	return nil
-	// var maxLoad = 0
-	// var target *Processor
-
-	// for _, p := range p.processors {
-	// 	if load := p.QueueSize(); load > maxLoad {
-	// 		maxLoad = load
-	// 		target = p
-	// 	}
-	// }
-	// return target
 }
 
 // tryStealFromProcessors attempts to steal from other processors
@@ -260,7 +250,6 @@ func (p *Processor) Execute(g *Goroutine) {
 	g.Finish(nil, nil)
 
 	p.metrics.tasksExecuted.Add(1)
-
 	p.SetState(ProcessorIdle)
 }
 
